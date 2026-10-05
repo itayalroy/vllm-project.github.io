@@ -15,44 +15,9 @@ tags:
 
 Before Elastic EP, changing a vLLM service's GPU count meant adding or removing whole model replicas, or restarting the engine with a different GPU count. As models grow larger, each replica needs more GPUs, so replica scaling adds or removes GPUs in increasingly large chunks. Restarting stopped our engine from serving for **197 seconds** (see our [benchmark](#performance-on-deepseek-v4-pro)).
 
-In our [first Elastic EP post](https://vllm.ai/blog/2026-05-14-elastic-expert-parallelism), we showed how vLLM could add or remove GPUs from a running MoE engine without restarting it. But avoiding a restart did not mean keeping it serving. Traffic effectively stopped throughout reconfiguration while we initialized new workers, prepared the expanded communication groups, loaded model weights, and repeated kernel warmup and CUDA graph capture. In our scale-up benchmark, blocking preparation meant existing requests stopped progressing and new requests were rejected for **100 seconds** (full details in the [performance section](#performance-on-deepseek-v4-pro)).
+In our [first Elastic EP post](https://vllm.ai/blog/2026-05-14-elastic-expert-parallelism), we showed how vLLM could add or remove GPUs from a running MoE engine without restarting it. But avoiding a restart did not mean keeping it serving. Traffic effectively stopped throughout reconfiguration while we initialized new workers, prepared the expanded communication groups, loaded model weights, and repeated kernel warmup and CUDA graph capture. In our DeepSeek V4 Pro benchmark, existing requests stopped progressing and new requests were rejected for **100 seconds when scaling from 16 to 20 GPUs** and **56 seconds when scaling back to 16 GPUs** (full details in the [performance section](#performance-on-deepseek-v4-pro)).
 
-In this blog, we describe how we brought Elastic EP reconfiguration to near-zero downtime. Asynchronous preparation lets existing workers keep serving while joining workers initialize, receive model weights, and prepare the target communication groups. But moving those tasks into the background was not enough: kernel warmup and CUDA graph capture still required existing workers to stop serving.
-
-[NIXL EP](https://github.com/ai-dynamo/nixl/blob/main/examples/device/ep/README.md) helped remove the remaining warmup and graph-recapture bottleneck. It lets us expand the existing EP communicator while keeping existing workers' CUDA graphs valid, and lets joining workers warm up kernels and capture graphs independently while serving continues. We also modified vLLM to preserve graph-visible tensors and kernel configurations across reconfiguration. Once preparation finishes, only a short coordinated switch remains. On DeepSeek V4 Pro, we achieved **0.82 seconds of downtime for scale-up** and **1.96 seconds for scale-down**.
-
-## Performance on DeepSeek V4 Pro
-
-### Scale-up and scale-down timings
-
-We benchmarked DeepSeek V4 Pro on GB200 GPUs, scaling from 16 to 20 GPUs and back. We compared three designs:
-
-- **A: Blocking preparation.** All preparation, warmup, and graph capture happen while serving is paused.
-- **B: Asynchronous preparation.** Startup, communication setup, and weight transfer run in the background; warmup and graph recapture still pause serving.
-- **C: Asynchronous preparation + graph reuse.** Existing graphs stay valid, and joining workers prepare independently of serving workers. This design is supported only by NIXL EP.
-
-**Downtime** is the observed serving interruption: in-flight requests stop progressing and new requests are not admitted. **Total time** is the duration of the full scaling operation, including preparation. The two durations are measured separately.
-
-| Metric | A: Blocking | B: Async preparation | C: Async preparation + graph reuse |
-| --- | ---: | ---: | ---: |
-| 16 to 20 GPUs: downtime | 99.62 s | 58.04 s | **0.82 s** |
-| 20 to 16 GPUs: downtime | 56.25 s | 44.07 s | **1.96 s** |
-| 16 to 20 GPUs: total time | 99.72 s | 97.27 s | 92.34 s |
-| 20 to 16 GPUs: total time | 56.21 s | 51.46 s | 9.32 s |
-
-All configurations passed numerical correctness checks, including checks on every joining worker.
-
-### Maintaining the SLO while adding GPUs
-
-We served DeepSeek V4 Pro on 16 GPUs, then gradually increased the incoming request rate from about 8 to 16 requests per second. We replayed the same 11,391-request scenario against three deployments: one stayed at 16 GPUs, one restarted with 20 GPUs, and one scaled to 20 GPUs using Elastic EP with NIXL EP. The service-level objective (SLO) was a rolling p95 time to first token below 5 seconds.
-
-![Elastic EP stays below the SLO throughout the scenario. During preparation, its serving performance matches the static 16-GPU deployment. After scaling, it matches the recovered 20-GPU deployment's performance.](/assets/figures/2026-10-05-elastic-ep-near-zero-downtime/figure00-pytorch-slo.png)
-
-*Figure 1. End-to-end serving under rising request load. Curves show 30-second rolling p95 outcomes, with failed requests assigned a 30-second penalty rather than a measured TTFT.*
-
-- Elastic EP completed all 11,391 requests and stayed below the SLO throughout the scenario.
-- During preparation, Elastic EP matched the static 16-GPU deployment's serving performance, with no visible degradation from background preparation.
-- After scaling, Elastic EP matched the recovered 20-GPU deployment's performance, with no visible post-scale degradation.
+In this blog, we describe how asynchronous preparation and [NIXL EP](https://github.com/ai-dynamo/nixl/blob/main/examples/device/ep/README.md) brought Elastic EP reconfiguration to near-zero downtime. In the same benchmark, we reduced downtime to **0.82 seconds for scaling from 16 to 20 GPUs** and **1.96 seconds for scaling back to 16 GPUs**.
 
 ## Prepare the target topology while the current one serves
 
@@ -83,7 +48,7 @@ During preparation, vLLM's background thread connects joining peers without acti
 
 ![The same NIXL EP communicator progresses from the current active group to connected inactive joining peers, then activates the target group at commit.](/assets/figures/2026-10-05-elastic-ep-near-zero-downtime/figure02-nixl-ep-lifecycle.png)
 
-*Figure 2. Connecting and activating new EP peers. Green ranks are active; gray ranks are connected but masked. At commit, new peers are activated without replacing the agent or buffers.*
+*Figure 1. Connecting and activating new EP peers. Green ranks are active; gray ranks are connected but masked. At commit, new peers are activated without replacing the agent or buffers.*
 
 vLLM still creates new DP coordination groups and EPLB groups for the target topology, **but their communication runs outside the captured model forward**, so switching to them does not invalidate CUDA graphs.
 
@@ -103,7 +68,7 @@ We also changed vLLM to keep the surrounding compute kernels' captured arguments
 
 Dispatch outputs are also inputs to expert computation. If their addresses or layouts changed with EP size, the captured expert kernels would still use the old pointers and offsets. Both NIXL EP and vLLM preserve these addresses and layouts across reconfiguration.
 
-Together, these changes allow retained workers to reuse their existing graphs after both scale-up and scale-down.
+Together, these changes allow retained workers to [reuse their existing CUDA graphs](https://github.com/vllm-project/vllm/pull/54985) after both scale-up and scale-down.
 
 ## Prepare joining workers independently
 
@@ -115,9 +80,52 @@ NIXL EP lets each joining worker temporarily mask every remote EP peer during wa
 
 ![Existing workers serve with their current peers active and joining peers masked. Each joining worker keeps only itself active for local warmup and graph capture, masking all remote peers, including other joining workers.](/assets/figures/2026-10-05-elastic-ep-near-zero-downtime/figure04-independent-capture.png)
 
-*Figure 3. Green ranks are active for EP communication; gray ranks are masked. Existing workers serve together while each joining worker masks all remote EP peers for preparation.*
+*Figure 2. Green ranks are active for EP communication; gray ranks are masked. Existing workers serve together while each joining worker masks all remote EP peers for preparation.*
 
 After capture, NIXL EP can reactivate peers without invalidating the graphs. Joining workers reuse their locally captured graphs when serving begins on the expanded group.
+
+## Performance on DeepSeek V4 Pro
+
+### Scale-up and scale-down timings
+
+We benchmarked DeepSeek V4 Pro on GB200 GPUs, scaling from 16 to 20 GPUs and back. The table shows how each optimization step reduced the work done while serving was paused. Background work overlaps with serving on existing workers.
+
+| Stage | A: Blocking | B: Async preparation | C: Async preparation + graph reuse |
+| --- | --- | --- | --- |
+| Initialize joining workers | Serving paused | Background | Background |
+| Prepare target communication | Serving paused | Background | Background |
+| Transfer model weights | Serving paused | Background | Background |
+| Warmup and graph capture on existing workers | Serving paused | Serving paused | Not needed (existing graphs stay valid) |
+| Warmup and graph capture on joining workers | Serving paused | Serving paused | Background |
+| Activate the target topology | Serving paused | Serving paused | Serving paused |
+
+Configuration C is supported **only by NIXL EP**.
+
+- **Downtime:** the observed serving interruption, when in-flight requests stop progressing and new requests are not admitted.
+- **Total time:** the duration of the full scaling operation, including preparation.
+
+The two durations are measured separately.
+
+| Metric | A: Blocking | B: Async preparation | C: Async preparation + graph reuse |
+| --- | ---: | ---: | ---: |
+| 16 to 20 GPUs: downtime | 99.62 s | 58.04 s | **0.82 s** |
+| 20 to 16 GPUs: downtime | 56.25 s | 44.07 s | **1.96 s** |
+| 16 to 20 GPUs: total time | 99.72 s | 97.27 s | 92.34 s |
+| 20 to 16 GPUs: total time | 56.21 s | 51.46 s | 9.32 s |
+
+All configurations passed numerical correctness checks, including checks on every joining worker.
+
+### Maintaining the SLO while adding GPUs
+
+We served DeepSeek V4 Pro on 16 GPUs, then gradually increased the incoming request rate from about 8 to 16 requests per second. We replayed the same 11,391-request scenario against three deployments: one stayed at 16 GPUs, one restarted with 20 GPUs, and one scaled to 20 GPUs using Elastic EP with NIXL EP. The service-level objective (SLO) was a rolling p95 time to first token below 5 seconds.
+
+![Elastic EP stays below the SLO throughout the scenario. During preparation, its serving performance matches the static 16-GPU deployment. After scaling, it matches the recovered 20-GPU deployment's performance.](/assets/figures/2026-10-05-elastic-ep-near-zero-downtime/figure00-pytorch-slo.png)
+
+*Figure 3. End-to-end serving under rising request load. Curves show 30-second rolling p95 outcomes, with failed requests assigned a 30-second penalty rather than a measured TTFT.*
+
+- Elastic EP completed all 11,391 requests and stayed below the SLO throughout the scenario.
+- During preparation, Elastic EP matched the static 16-GPU deployment's serving performance, with no visible degradation from background preparation.
+- After scaling, Elastic EP matched the recovered 20-GPU deployment's performance, with no visible post-scale degradation.
 
 ## Padding in expert-kernel inputs
 
